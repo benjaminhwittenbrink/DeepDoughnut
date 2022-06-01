@@ -6,6 +6,8 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers import ViTForImageClassification
 
+#from DenseNet import DenseNet 
+
 class Flatten(nn.Module):
 
    def forward(self, input):
@@ -15,8 +17,20 @@ class Flatten(nn.Module):
 
 class DenseCNNModel(nn.Module):
 
-	def __init__(self):
-		raise NotImplementedError
+	def __init__(self, 
+		in_channel=32, growth_rate=16, bottleneck_size=4, block_config=(6,12,8), 
+		dropout=0, transition_compression=0.5, num_classes=4
+	):
+		raise NotImplementedError		
+	# 	super().__init__()
+
+	# 	self.DenseNet = DenseNet(
+	# 		in_channel, growth_rate, bottleneck_size, block_config, dropout, transition_compression, num_classes
+	# 	)
+
+	# def forward(self, X):
+	# 	X_out = self.Dense(X)
+	# 	return X_out
 
 
 class LogisticRegression (nn.Module):
@@ -33,6 +47,7 @@ class LogisticRegression (nn.Module):
 	def forward(self, X):
 		X_out = self.fc(X)
 		return X_out
+
 
 class BasicCNNModel (nn.Module):
 	""" Simple 2D-CNN model """

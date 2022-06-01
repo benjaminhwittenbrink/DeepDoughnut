@@ -9,8 +9,10 @@ from datetime import datetime
 
 # PyTorch libraries 
 import torch 
+import torch.nn as nn 
 from torch.utils.data import DataLoader 
 from torchvision.datasets import DatasetFolder
+from torchvision import models, transforms 
 
 # Hugging Face datasets 
 import datasets 
@@ -38,15 +40,18 @@ random.seed(RANDOM_SEED)
 
 
 class ImageClassificationCollator:
-   def __init__(self, feature_extractor): 
-      self.feature_extractor = feature_extractor
-      
-   def __call__(self, batch):  
-      encodings = self.feature_extractor([x[0] for x in batch],
-      return_tensors='pt')   
-      encodings['labels'] = torch.tensor([x[1] for x in batch],    
-      dtype=torch.long)
-      return encodings
+	def __init__(self, feature_extractor, transforms = False): 
+		self.feature_extractor = feature_extractor
+		self.transforms = transforms 
+
+	def __call__(self, batch):
+		if self.transforms: 
+			transformed = [self.feature_extractor(x[0].cpu().detach().numpy()) for x in batch]
+			encodings = {"pixel_values":torch.stack(transformed)}
+		else: 
+			encodings = self.feature_extractor([x[0] for x in batch], return_tensors='pt')   
+		encodings['labels'] = torch.tensor([x[1] for x in batch],  dtype=torch.long)
+		return encodings
 
 # create model and collator
 def create_model_and_collator(args, model_name):
@@ -54,13 +59,58 @@ def create_model_and_collator(args, model_name):
 	if model_name == "ViT":
 		feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224-in21k')
 		collator = ImageClassificationCollator(feature_extractor)
+		collators = (collator, collator)
 		model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224-in21k', num_labels=CLASSES)
 	
+	elif model_name in ['resnet', 'alexnet', 'vgg', 'squeezenet', 'densenet']:
+		# note all models expect image of (3, 224, 224)
+
+		train_data_transforms = transforms.Compose([
+			transforms.ToPILImage(),
+			transforms.RandomResizedCrop(224), # i.e. want 224 by 224 
+			transforms.RandomHorizontalFlip(),  
+			transforms.ToTensor(),
+			transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+		])
+		val_data_transforms = transforms.Compose([
+			transforms.ToPILImage(),
+			transforms.Resize(224), # i.e. want 224 by 224 
+			transforms.CenterCrop(224), 
+			transforms.ToTensor(), 
+			transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+		])
+		train_collator = ImageClassificationCollator(train_data_transforms, transforms=True)
+		val_collator = ImageClassificationCollator(val_data_transforms, transforms=True)
+
+		collators = (train_collator, val_collator)
+
+		if model_name == 'resnet':
+			model = models.resnet18(pretrained=True)
+			model.fc = nn.Linear(model.fc.in_features, CLASSES)
+
+		elif model_name == 'alexnet':
+			model = models.alexnet(pretrained=True)
+			model.classifier[6] = nn.Linear(model.classifier[6].in_features, CLASSES)
+
+		elif model_name == 'vgg':
+			model = models.vgg11_bn(pretrained=True)
+			model.classifier[6] = nn.Linear(model.classifier[6].in_features, CLASSES)
+
+		elif model_name == 'squeezenet': 
+			model = models.squeezenet1_0(pretrained=True)
+			model.classifier[1] = nn.Conv2d(512, CLASSES, kernel_size=1, stride=1)
+			model.num_classes = CLASSES
+
+		else: 
+			# dense net 
+			model = models.densenet121(pretrained=True)
+			model.classifier = nn.Linear(model.classifier.in_features, CLASSES) 
+
 	elif model_name in ['basic_cnn', 'dense_cnn', 'logistic_regression']:
 		# ADD IN transforms though feature extractor might be easier 
 		feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224-in21k')
 		collator = ImageClassificationCollator(feature_extractor)
-
+		collators = (collator, collator)
 		if model_name == "logistic_regression":
 			model = LogisticRegression(n_classes=CLASSES)
 		elif model_name == "basic_cnn":
@@ -73,10 +123,10 @@ def create_model_and_collator(args, model_name):
 
 	print(f'Model name: {model_name}')
 
-	return collator, model 
+	return collators, model 
 
 
-def create_dataset(args, collator_fn, extensions = ['.jpg.npy']):
+def create_dataset(args, collator_fns, extensions = ['.jpg.npy'], val_split = 0.15):
 
 	def npy_loader(path):
 		sample = torch.from_numpy(np.load(path))
@@ -90,12 +140,12 @@ def create_dataset(args, collator_fn, extensions = ['.jpg.npy']):
 	)
 	# split up into train val data  
 	indices = torch.randperm(len(dataset)).tolist()
-	n_val = int(np.floor(len(indices) * .15))
+	n_val = int(np.floor(len(indices) * val_split))
 	train_ds = torch.utils.data.Subset(dataset, indices[:-n_val])
 	val_ds = torch.utils.data.Subset(dataset, indices[-n_val:])
 
-	train_dl = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collator_fn, shuffle = 1)
-	val_dl = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=collator_fn, shuffle=0)
+	train_dl = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collator_fns[0], shuffle = 1)
+	val_dl = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=collator_fns[1], shuffle=0)
 
 	return [train_dl, val_dl]
 
@@ -129,7 +179,10 @@ def validation(args, val_loader, model, criterion, device, name = 'Validation', 
 		labels = labels.to(device)
 
 		with torch.no_grad():
-			if args.model_name in ['basic_cnn', 'dense_cnn', 'logistic_regression']:
+			if args.model_name in [
+			'basic_cnn', 'dense_cnn', 'logistic_regression',
+			'resnet', 'alexnet', 'vgg', 'squeezenet', 'densenet'
+			]:
 				outputs = model(inputs)
 			else: 
 				outputs = model(inputs)['logits'] 
@@ -153,6 +206,7 @@ def validation(args, val_loader, model, criterion, device, name = 'Validation', 
 	return total_loss, float(total_correct / total_sample) * 100
 
 
+
 def train(args, data_loaders, epoch_n, model, optim, scheduler, criterion, device, write_file=None):
 	print("\n>>> Training starts...")
 
@@ -165,6 +219,8 @@ def train(args, data_loaders, epoch_n, model, optim, scheduler, criterion, devic
 	for epoch in range(epoch_n):
 		print("*** Epoch:", epoch)
 		total_train_loss = 0. 
+		total_correct = 0
+		total_sample = 0
 
 		for i, batch in enumerate(tqdm(data_loaders[0])): 
 			optim.zero_grad()
@@ -173,25 +229,35 @@ def train(args, data_loaders, epoch_n, model, optim, scheduler, criterion, devic
 			labels = labels.to(device, non_blocking=True)
 
 			# forward pass 
-			if args.model_name in ['basic_cnn', 'dense_cnn', 'logistic_regression']:
+			if args.model_name in [
+				'basic_cnn', 'dense_cnn', 'logistic_regression', 
+				'resnet', 'alexnet', 'vgg', 'squeezenet', 'densenet'
+			]:
 				outputs = model(inputs)
 			else: 
 				outputs = model(inputs)['logits']
 
 			loss = criterion(outputs, labels)
+			logits = outputs
+			correct_n, sample_n, c_matrix = measure_accuracy(logits.cpu().detach().numpy(), labels.cpu().detach().numpy())
+			total_correct += correct_n 
+			total_sample += sample_n 
+
 			total_train_loss += loss.cpu().item()
 
 			# backward pass 
 			loss.backward()
 			optim.step()
-			if scheduler:
-				scheduler.step()
+
+			if scheduler: scheduler.step()
 
 			if i % args.val_every == 0: 
 				print(f'*** Loss: {loss}')
-
-				if write_file: 
+				print(f'*** Running accuracy on the train set: {total_correct/total_sample}')
+				if write_file:
 					write_file.write(f'\nEpoch: {epoch}, Step: {i}\n')
+					write_file.write(f'*** Loss: {loss}\n')
+					write_file.write(f'*** Running accuracy on the train set: {total_correct/total_sample}\n')
 
 				_, val_acc = validation(args, data_loaders[1], model, criterion, device, write_file=write_file)
 
@@ -248,7 +314,7 @@ if __name__ == '__main__':
 
 
 	if filename is None: 
-		filename = f'./results/{args.model_name}/{datetime.now().time()}.txt'
+		filename = f'./results/{args.model_name}/{datetime.now()}.txt'
 
 	write_file = open(filename, "w")
 
@@ -256,14 +322,14 @@ if __name__ == '__main__':
 		write_file.write(f'*** args: {args}\n\n')
 
 	# create model 
-	collator, model = create_model_and_collator(
+	collators, model = create_model_and_collator(
 		args = args, 
 		model_name = args.model_name
 	)
 
 	# load data 
 	data_loaders = create_dataset(
-		args = args, collator_fn = collator
+		args = args, collator_fns = collators
 	)
 
 	train_label_stats = dataset_statistics(args, data_loaders[0])
