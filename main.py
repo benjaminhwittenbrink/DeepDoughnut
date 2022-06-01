@@ -1,5 +1,5 @@
 # standard libraries 
-
+import os 
 import argparse 
 import random 
 import numpy as np 
@@ -11,11 +11,12 @@ from datetime import datetime
 import torch 
 import torch.nn as nn 
 from torch.utils.data import DataLoader 
-from torchvision.datasets import DatasetFolder
+from torch.utils.data.sampler import WeightedRandomSampler 
+from torchvision.datasets import DatasetFolder, ImageFolder 
 from torchvision import models, transforms 
 
 # Hugging Face datasets 
-import datasets 
+#import datasets 
 
 # Transformers libraries 
 from transformers import TrainingArguments, Trainer
@@ -37,6 +38,8 @@ RANDOM_SEED = 231
 torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
+
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 
 class ImageClassificationCollator:
@@ -126,6 +129,20 @@ def create_model_and_collator(args, model_name):
 	return collators, model 
 
 
+def make_weights_for_balanced_classes(images, n_classes):
+	count = [0] * n_classes
+	for item in images: 
+		count[item[1]] += 1 
+	weight_per_class = [0.] * n_classes 
+	N = float(sum(count))
+	for i in range(n_classes):
+		weight_per_class[i] = N / float(count[i])
+	weight = [0] * len(images)
+	for idx, val in enumerate(images):
+		weight[idx] = weight_per_class[val[1]]
+	
+	return weight, weight_per_class
+
 def create_dataset(args, collator_fns, extensions = ['.jpg.npy'], val_split = 0.15):
 
 	def npy_loader(path):
@@ -133,21 +150,31 @@ def create_dataset(args, collator_fns, extensions = ['.jpg.npy'], val_split = 0.
 		return sample 
 
 	# load in dataset frmom directory 
-	dataset = DatasetFolder(
-		root = args.data_dir, 
-		loader = npy_loader, 
-		extensions = extensions
+	# dataset = DatasetFolder(
+	# 	root = args.data_dir, 
+	# 	loader = npy_loader, 
+	# 	extensions = extensions
+	# )
+	dataset = ImageFolder(
+		root = args.data_dir
 	)
+	weights, class_weights = make_weights_for_balanced_classes(dataset.imgs, len(dataset.classes))
+	weights = torch.FloatTensor(weights)
+	class_weights = torch.FloatTensor(class_weights)
+
 	# split up into train val data  
 	indices = torch.randperm(len(dataset)).tolist()
 	n_val = int(np.floor(len(indices) * val_split))
 	train_ds = torch.utils.data.Subset(dataset, indices[:-n_val])
 	val_ds = torch.utils.data.Subset(dataset, indices[-n_val:])
 
+	train_weights = weights[indices[:-n_val]]
+	train_sampler = WeightedRandomSampler(train_weights, len(train_weights))
+
 	train_dl = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collator_fns[0], shuffle = 1)
 	val_dl = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=collator_fns[1], shuffle=0)
 
-	return [train_dl, val_dl]
+	return [train_dl, val_dl], class_weights
 
 def dataset_statistics(args, dataset_loader):
 	label_stats = collections.Counter()
@@ -187,7 +214,8 @@ def validation(args, val_loader, model, criterion, device, name = 'Validation', 
 			else: 
 				outputs = model(inputs)['logits'] 
 
-		loss = criterion(outputs, labels)
+		logits = outputs.to(device)
+		loss = criterion(logits, labels)
 
 		logits = outputs 
 		total_loss += loss.cpu().item()
@@ -237,11 +265,12 @@ def train(args, data_loaders, epoch_n, model, optim, scheduler, criterion, devic
 			else: 
 				outputs = model(inputs)['logits']
 
-			loss = criterion(outputs, labels)
-			logits = outputs
-			correct_n, sample_n, c_matrix = measure_accuracy(logits.cpu().detach().numpy(), labels.cpu().detach().numpy())
-			total_correct += correct_n 
-			total_sample += sample_n 
+			logits = outputs.to(device)
+			loss = criterion(logits, labels)
+			
+			#correct_n, sample_n, c_matrix = measure_accuracy(logits.cpu().detach().numpy(), labels.cpu().detach().numpy())
+			#total_correct += correct_n 
+			#total_sample += sample_n 
 
 			total_train_loss += loss.cpu().item()
 
@@ -253,11 +282,11 @@ def train(args, data_loaders, epoch_n, model, optim, scheduler, criterion, devic
 
 			if i % args.val_every == 0: 
 				print(f'*** Loss: {loss}')
-				print(f'*** Running accuracy on the train set: {total_correct/total_sample}')
+				#print(f'*** Running accuracy on the train set: {total_correct/total_sample}')
 				if write_file:
 					write_file.write(f'\nEpoch: {epoch}, Step: {i}\n')
 					write_file.write(f'*** Loss: {loss}\n')
-					write_file.write(f'*** Running accuracy on the train set: {total_correct/total_sample}\n')
+					#write_file.write(f'*** Running accuracy on the train set: {total_correct/total_sample}\n')
 
 				_, val_acc = validation(args, data_loaders[1], model, criterion, device, write_file=write_file)
 
@@ -327,8 +356,11 @@ if __name__ == '__main__':
 		model_name = args.model_name
 	)
 
+	if torch.cuda.is_available():
+		model.cuda() 
+
 	# load data 
-	data_loaders = create_dataset(
+	data_loaders, train_class_weights = create_dataset(
 		args = args, collator_fns = collators
 	)
 
@@ -352,7 +384,8 @@ if __name__ == '__main__':
 
 	# ADD SUPPORT FOR CLASS WEIGHTS 
 	# would be passed as weight =class_weights
-	criterion = torch.nn.CrossEntropyLoss()
+	train_class_weights = train_class_weights.cuda()
+	criterion = torch.nn.CrossEntropyLoss(weight = train_class_weights)
 
 	if write_file: 
 		write_file.write(f'\nModel:\n {model}\nOptimizer:{optim}\n')
