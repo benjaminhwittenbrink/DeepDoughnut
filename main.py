@@ -26,7 +26,7 @@ from sklearn.naive_bayes import BernoulliNB, MultinomialNB
 #import naive_bayes_utils 
 
 # simple models
-#from models import LogisticRegression, BasicCNNModel, DenseCNNModel
+from models import LogisticRegression, BasicCNNModel, DenseCNNModel
 
 from sklearn.metrics import confusion_matrix
 
@@ -35,10 +35,6 @@ RANDOM_SEED = 231
 torch.manual_seed(RANDOM_SEED)
 np.random.seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
-
-# Number of classes 
-CLASSES = 4
-CLASS_NAMES = [i for i in range(CLASSES)]
 
 
 class ImageClassificationCollator:
@@ -52,8 +48,8 @@ class ImageClassificationCollator:
       dtype=torch.long)
       return encodings
 
-# create model and feature extractor 
-def create_model_and_extractor(args, model_name):
+# create model and collator
+def create_model_and_collator(args, model_name):
 
 	if model_name == "ViT":
 		feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224-in21k')
@@ -63,6 +59,7 @@ def create_model_and_extractor(args, model_name):
 	elif model_name in ['basic_cnn', 'dense_cnn', 'logistic_regression']:
 		# ADD IN transforms though feature extractor might be easier 
 		feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224-in21k')
+		collator = ImageClassificationCollator(feature_extractor)
 
 		if model_name == "logistic_regression":
 			model = LogisticRegression(n_classes=CLASSES)
@@ -76,7 +73,7 @@ def create_model_and_extractor(args, model_name):
 
 	print(f'Model name: {model_name}')
 
-	return feature_extractor, collator, model 
+	return collator, model 
 
 
 def create_dataset(args, collator_fn, extensions = ['.jpg.npy']):
@@ -153,7 +150,7 @@ def validation(args, val_loader, model, criterion, device, name = 'Validation', 
 		write_file.write(f'*** Accuracy on the {name} set: {total_correct/total_sample}\n')
 		write_file.write(f'*** Confusion matrix:\n{total_confusion}\n')
 
-	return total_loss, float(total_correct / total_sample) * 100 _
+	return total_loss, float(total_correct / total_sample) * 100
 
 
 def train(args, data_loaders, epoch_n, model, optim, scheduler, criterion, device, write_file=None):
@@ -222,7 +219,8 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser()
 
 	parser.add_argument('--data_dir', default='sample', type=str, help='Image data location.')
-	
+
+	parser.add_argument('--n_classes', default=4, type=int, help='Number of classes in outcome variable.')	
 	parser.add_argument('--batch_size', default=16, type=int, help='Batch size.')
 	parser.add_argument('--epoch_n', default=3, type=int, help='Number of epochs for training.')
 	parser.add_argument('--val_every', default=100, type=int, help="Number of iterations we should take to perform validation.")
@@ -239,6 +237,11 @@ if __name__ == '__main__':
 
 
 	args = parser.parse_args()
+
+	# Number of classes 
+	CLASSES = args.n_classes
+	CLASS_NAMES = [i for i in range(CLASSES)]
+
 	epoch_n = args.epoch_n
 
 	filename = args.filename 
@@ -253,7 +256,7 @@ if __name__ == '__main__':
 		write_file.write(f'*** args: {args}\n\n')
 
 	# create model 
-	feature_extractor, collator, model = create_model_and_extractor(
+	collator, model = create_model_and_collator(
 		args = args, 
 		model_name = args.model_name
 	)
@@ -274,12 +277,11 @@ if __name__ == '__main__':
 
 
 	if args.model_name in ['logistic_regression', 'basic_cnn', 'dense_cnn']:
-		optim = torch.optim.Adam(parmas = model.parameters())
+		optim = torch.optim.Adam(params = model.parameters())
 	else: 
 		optim = torch.optim.AdamW(params=model.parameters(), lr=args.lr, eps=args.eps)
-		total_steps = len(data_loaders[0]) * args.epoch_n 
-
-
+	
+	total_steps = len(data_loaders[0]) * args.epoch_n 
 	scheduler = get_linear_schedule_with_warmup(optim, num_warmup_steps=0, num_training_steps = total_steps)
 
 	# ADD SUPPORT FOR CLASS WEIGHTS 
