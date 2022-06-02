@@ -44,9 +44,10 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 
 class ImageClassificationCollator:
-	def __init__(self, feature_extractor, transforms = False): 
+	def __init__(self, feature_extractor, transforms = False, regression = False): 
 		self.feature_extractor = feature_extractor
 		self.transforms = transforms 
+		self.regression = regression
 
 	def __call__(self, batch):
 		if self.transforms: 
@@ -54,7 +55,11 @@ class ImageClassificationCollator:
 			encodings = {"pixel_values":torch.stack(transformed)}
 		else: 
 			encodings = self.feature_extractor([x[0] for x in batch], return_tensors='pt')   
-		encodings['labels'] = torch.tensor([x[1] for x in batch],  dtype=torch.long)
+		
+		if self.regression: 
+			encodings['labels'] = torch.tensor([x[1] for x in batch], dtype=torch.float)
+		else:
+			encodings['labels'] = torch.tensor([x[1] for x in batch],  dtype=torch.long)
 		return encodings
 
 # create model and collator
@@ -62,7 +67,7 @@ def create_model_and_collator(args, model_name):
 
 	if model_name == "ViT":
 		feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224-in21k')
-		collator = ImageClassificationCollator(feature_extractor)
+		collator = ImageClassificationCollator(feature_extractor, regression = args.regression)
 		collators = (collator, collator)
 		model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224-in21k', num_labels=CLASSES)
 	
@@ -81,8 +86,8 @@ def create_model_and_collator(args, model_name):
 			transforms.ToTensor(), 
 			transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 		])
-		train_collator = ImageClassificationCollator(train_data_transforms, transforms=True)
-		val_collator = ImageClassificationCollator(val_data_transforms, transforms=True)
+		train_collator = ImageClassificationCollator(train_data_transforms, transforms=True, regression = args.regression)
+		val_collator = ImageClassificationCollator(val_data_transforms, transforms=True, regression = args.regression)
 
 		collators = (train_collator, val_collator)
 
@@ -111,7 +116,7 @@ def create_model_and_collator(args, model_name):
 	elif model_name in ['basic_cnn', 'dense_cnn', 'logistic_regression']:
 		# ADD IN transforms though feature extractor might be easier 
 		feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224-in21k')
-		collator = ImageClassificationCollator(feature_extractor)
+		collator = ImageClassificationCollator(feature_extractor, transforms = True, regression = args.regression)
 		collators = (collator, collator)
 		if model_name == "logistic_regression":
 			model = LogisticRegression(n_classes=CLASSES)
@@ -129,18 +134,14 @@ def create_model_and_collator(args, model_name):
 
 
 class RegressionImageFolder(ImageFolder):
-
-# basically need to pass in dict that takes filename --> score 
-
+	# basically need to pass in dict that takes filename --> score 
 	def __init__(self, root, image_scores_pkl_path, **kwargs): 
 		super().__init__(root, **kwargs)
-
 		with open(image_scores_pkl_path, "rb") as f:
 			image_scores = pickle.load(f) 
-
 		paths, _ = zip(*self.imgs)
-
-		self.targets = [image_scores[path] for path in paths]
+		path_keys = [p.split("/")[-1] for p in paths]
+		self.targets = [float(image_scores[pk]) for pk in path_keys]
 		self.samples = self.imgs = list(zip(paths, self.targets))
 
 
@@ -158,7 +159,15 @@ def make_weights_for_balanced_classes(images, n_classes):
 	
 	return weight, weight_per_class
 
-def create_dataset(args, collator_fns, extensions = ['.jpg.npy'], val_split = 0.15):
+
+def index_split(dataset, p):
+	indices = torch.randperm(len(dataset)).tolist()
+	n_val = int(np.floor(len(indices) * p))
+	train_ds = torch.utils.data.Subset(dataset, indices[:-n_val])
+	val_ds = torch.utils.data.Subset(dataset, indices[-n_val:])
+	return train_ds, val_ds, indices[:-n_val]
+
+def create_dataset(args, collator_fns, extensions = ['.jpg.npy'], val_split = 0.15, test_split = 0.1):
 
 	# def npy_loader(path):
 	# 	sample = torch.from_numpy(np.load(path))
@@ -178,6 +187,7 @@ def create_dataset(args, collator_fns, extensions = ['.jpg.npy'], val_split = 0.
 			image_scores_pkl_path = args.reg_scores_dict
 		)
 	else: 
+		# Note: would be better if we created separate train, val, test folders 
 		dataset = ImageFolder(
 			root = args.data_dir
 		)
@@ -190,21 +200,20 @@ def create_dataset(args, collator_fns, extensions = ['.jpg.npy'], val_split = 0.
 		class_weights = torch.FloatTensor(class_weights)
 
 	# split up into train val data  
-	indices = torch.randperm(len(dataset)).tolist()
-	n_val = int(np.floor(len(indices) * val_split))
-	train_ds = torch.utils.data.Subset(dataset, indices[:-n_val])
-	val_ds = torch.utils.data.Subset(dataset, indices[-n_val:])
+	train_ds, test_ds, indices_split1 = index_split(dataset, test_split)
+	train_ds, val_ds, indices_split2 = index_split(train_ds, val_split)
 
 	if args.regression: 
-		train_sampler = RandomSampler()
+		train_sampler = RandomSampler(train_ds)
 	else: 
-		train_weights = weights[indices[:-n_val]]
+		train_weights = weights[indices_split1][indices_split2]
 		train_sampler = WeightedRandomSampler(train_weights, len(train_weights))
 
-	train_dl = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collator_fns[0], shuffle = 1)
+	train_dl = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collator_fns[0], sampler = train_sampler)
 	val_dl = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=collator_fns[1], shuffle=0)
+	test_dl = DataLoader(test_ds, batch_size=args.batch_size, collate_fn=collator_fns[1], shuffle=0)
 
-	return [train_dl, val_dl], class_weights
+	return [train_dl, val_dl, test_dl], class_weights
 
 def label_statistics(args, dataset_loader):
 	if args.regression: 
@@ -228,7 +237,10 @@ def validation(args, val_loader, model, criterion, device, name = 'Validation', 
 
 	model.eval()
 	total_loss = 0. 
-	if not args.regression: 
+	if args.regression:
+		y_pred = []
+		y_true = []
+	else:	 
 		total_correct = 0 
 		total_sample = 0 
 		total_confusion = np.zeros((CLASSES, CLASSES))
@@ -248,21 +260,34 @@ def validation(args, val_loader, model, criterion, device, name = 'Validation', 
 				outputs = model(inputs)['logits'] 
 
 		logits = outputs.to(device)
-		loss = criterion(logits, labels)
+		if args.regression:
+			logits = logits.squeeze()
+			loss = criterion(logits, labels)
+		else:
+			loss = criterion(logits, labels)
 
 		logits = outputs 
 		total_loss += loss.cpu().item()
 
-		if not args.regression: 
+		if args.regression: 
+			y_pred += list(logits.cpu().numpy()) 
+			y_true += list(labels.cpu().numpy())
+		else:
 			correct_n, sample_n, c_matrix = measure_accuracy(logits.cpu().numpy(), labels.cpu().numpy())
 			total_correct += correct_n 
 			total_sample += sample_n 
 			total_confusion += c_matrix 
 
 	if args.regression:
-		print(f'*** Total mean squared error on the {name} set: {total_loss}')
+		mse = np.mean( (np.array(y_pred) - np.array(y_true))**2 )
+
+		print(f'*** Mean squared error on the {name} set: {mse}')
+		print(f'*** Quantiles of true labels on the {name} set: {np.quantile(y_true, [0.1, 0.25, 0.5, 0.75, 0.9])}')
+		print(f'*** Quantiles of predictions on the {name} set: {np.quantile(y_pred, [0.1, 0.25, 0.5, 0.75, 0.9])}')
+
 		if write_file:
-			write_file.write(f'*** Total mean squared error on the {name} set: {total_loss}\n')
+			write_file.write(f'*** Mean squared error on the {name} set: {mse}')
+			write_file.write(f'*** Quantiles of predictions on the {name} set: {np.quantile(y_pred, [0.1, 0.25, 0.5, 0.75, 0.9])}\n')
 
 		# want to pick the best "accuracy" <> equivalent to picking greatest neg loss 
 		val_acc = - total_loss
@@ -310,8 +335,11 @@ def train(args, data_loaders, epoch_n, model, optim, scheduler, criterion, devic
 				outputs = model(inputs)['logits']
 
 			logits = outputs.to(device)
-			loss = criterion(logits, labels)
 			
+			if args.regression:
+				loss = criterion(logits.squeeze(), labels)
+			else:
+				loss = criterion(logits, labels)
 			#correct_n, sample_n, c_matrix = measure_accuracy(logits.cpu().detach().numpy(), labels.cpu().detach().numpy())
 			#total_correct += correct_n 
 			#total_sample += sample_n 
@@ -344,6 +372,8 @@ def train(args, data_loaders, epoch_n, model, optim, scheduler, criterion, devic
 							model.save_pretrained(args.save_path)
 						else: 
 							torch.save(model.state_dict(), args.save_path)
+			
+	validation(args, data_loaders[2], model, criterion, device, name="Test", write_file=write_file)
 
 
 
