@@ -1,5 +1,6 @@
 # standard libraries 
 import os 
+import pickle 
 import argparse 
 import random 
 import numpy as np 
@@ -11,7 +12,7 @@ from datetime import datetime
 import torch 
 import torch.nn as nn 
 from torch.utils.data import DataLoader 
-from torch.utils.data.sampler import WeightedRandomSampler 
+from torch.utils.data.sampler import RandomSampler, WeightedRandomSampler 
 from torchvision.datasets import DatasetFolder, ImageFolder 
 from torchvision import models, transforms 
 
@@ -49,7 +50,7 @@ class ImageClassificationCollator:
 
 	def __call__(self, batch):
 		if self.transforms: 
-			transformed = [self.feature_extractor(x[0].cpu().detach().numpy()) for x in batch]
+			transformed = [self.feature_extractor(x[0]) for x in batch]
 			encodings = {"pixel_values":torch.stack(transformed)}
 		else: 
 			encodings = self.feature_extractor([x[0] for x in batch], return_tensors='pt')   
@@ -69,14 +70,12 @@ def create_model_and_collator(args, model_name):
 		# note all models expect image of (3, 224, 224)
 
 		train_data_transforms = transforms.Compose([
-			transforms.ToPILImage(),
 			transforms.RandomResizedCrop(224), # i.e. want 224 by 224 
 			transforms.RandomHorizontalFlip(),  
 			transforms.ToTensor(),
 			transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 		])
 		val_data_transforms = transforms.Compose([
-			transforms.ToPILImage(),
 			transforms.Resize(224), # i.e. want 224 by 224 
 			transforms.CenterCrop(224), 
 			transforms.ToTensor(), 
@@ -129,6 +128,22 @@ def create_model_and_collator(args, model_name):
 	return collators, model 
 
 
+class RegressionImageFolder(ImageFolder):
+
+# basically need to pass in dict that takes filename --> score 
+
+	def __init__(self, root, image_scores_pkl_path, **kwargs): 
+		super().__init__(root, **kwargs)
+
+		with open(image_scores_pkl_path, "rb") as f:
+			image_scores = pickle.load(f) 
+
+		paths, _ = zip(*self.imgs)
+
+		self.targets = [image_scores[path] for path in paths]
+		self.samples = self.imgs = list(zip(paths, self.targets))
+
+
 def make_weights_for_balanced_classes(images, n_classes):
 	count = [0] * n_classes
 	for item in images: 
@@ -145,22 +160,34 @@ def make_weights_for_balanced_classes(images, n_classes):
 
 def create_dataset(args, collator_fns, extensions = ['.jpg.npy'], val_split = 0.15):
 
-	def npy_loader(path):
-		sample = torch.from_numpy(np.load(path))
-		return sample 
-
+	# def npy_loader(path):
+	# 	sample = torch.from_numpy(np.load(path))
+	# 	return sample 
 	# load in dataset frmom directory 
 	# dataset = DatasetFolder(
 	# 	root = args.data_dir, 
 	# 	loader = npy_loader, 
 	# 	extensions = extensions
 	# )
-	dataset = ImageFolder(
-		root = args.data_dir
-	)
-	weights, class_weights = make_weights_for_balanced_classes(dataset.imgs, len(dataset.classes))
-	weights = torch.FloatTensor(weights)
-	class_weights = torch.FloatTensor(class_weights)
+	# load in dataset from folder 
+	class_weights = None 
+
+	if args.regression: 
+		dataset = RegressionImageFolder(
+			root = args.data_dir, 
+			image_scores_pkl_path = args.reg_scores_dict
+		)
+	else: 
+		dataset = ImageFolder(
+			root = args.data_dir
+		)
+
+		if len(dataset.classes) != args.n_classes:
+			raise ValueError("Class argument does not match number of classes found in data directory.")
+
+		weights, class_weights = make_weights_for_balanced_classes(dataset.imgs, len(dataset.classes))
+		weights = torch.FloatTensor(weights)
+		class_weights = torch.FloatTensor(class_weights)
 
 	# split up into train val data  
 	indices = torch.randperm(len(dataset)).tolist()
@@ -168,21 +195,26 @@ def create_dataset(args, collator_fns, extensions = ['.jpg.npy'], val_split = 0.
 	train_ds = torch.utils.data.Subset(dataset, indices[:-n_val])
 	val_ds = torch.utils.data.Subset(dataset, indices[-n_val:])
 
-	train_weights = weights[indices[:-n_val]]
-	train_sampler = WeightedRandomSampler(train_weights, len(train_weights))
+	if args.regression: 
+		train_sampler = RandomSampler()
+	else: 
+		train_weights = weights[indices[:-n_val]]
+		train_sampler = WeightedRandomSampler(train_weights, len(train_weights))
 
 	train_dl = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collator_fns[0], shuffle = 1)
 	val_dl = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=collator_fns[1], shuffle=0)
 
 	return [train_dl, val_dl], class_weights
 
-def dataset_statistics(args, dataset_loader):
-	label_stats = collections.Counter()
+def label_statistics(args, dataset_loader):
+	if args.regression: 
+		return "No class labels for regression problem."
+	class_counts = collections.Counter()
 	for i, batch in enumerate(dataset_loader):
 		inputs, labels = batch['pixel_values'], batch['labels']
 		labels = labels.cpu().numpy().flatten()
-		label_stats += collections.Counter(labels)
-	return label_stats
+		class_counts += collections.Counter(labels)
+	return class_counts
 
 
 def measure_accuracy(outputs, labels):
@@ -196,9 +228,10 @@ def validation(args, val_loader, model, criterion, device, name = 'Validation', 
 
 	model.eval()
 	total_loss = 0. 
-	total_correct = 0 
-	total_sample = 0 
-	total_confusion = np.zeros((CLASSES, CLASSES))
+	if not args.regression: 
+		total_correct = 0 
+		total_sample = 0 
+		total_confusion = np.zeros((CLASSES, CLASSES))
 
 	for i, batch in enumerate(tqdm(val_loader)):
 		inputs, labels = batch['pixel_values'], batch['labels'] 
@@ -220,18 +253,29 @@ def validation(args, val_loader, model, criterion, device, name = 'Validation', 
 		logits = outputs 
 		total_loss += loss.cpu().item()
 
-		correct_n, sample_n, c_matrix = measure_accuracy(logits.cpu().numpy(), labels.cpu().numpy())
-		total_correct += correct_n 
-		total_sample += sample_n 
-		total_confusion += c_matrix 
+		if not args.regression: 
+			correct_n, sample_n, c_matrix = measure_accuracy(logits.cpu().numpy(), labels.cpu().numpy())
+			total_correct += correct_n 
+			total_sample += sample_n 
+			total_confusion += c_matrix 
 
-	print(f'*** Accuracy on the {name} set: {total_correct/total_sample}')
-	print(f'*** Confusion matrix:\n{total_confusion}')
-	if write_file:
-		write_file.write(f'*** Accuracy on the {name} set: {total_correct/total_sample}\n')
-		write_file.write(f'*** Confusion matrix:\n{total_confusion}\n')
+	if args.regression:
+		print(f'*** Total mean squared error on the {name} set: {total_loss}')
+		if write_file:
+			write_file.write(f'*** Total mean squared error on the {name} set: {total_loss}\n')
 
-	return total_loss, float(total_correct / total_sample) * 100
+		# want to pick the best "accuracy" <> equivalent to picking greatest neg loss 
+		val_acc = - total_loss
+	else: 
+		print(f'*** Accuracy on the {name} set: {total_correct/total_sample}')
+		print(f'*** Confusion matrix:\n{total_confusion}')
+		if write_file:
+			write_file.write(f'*** Accuracy on the {name} set: {total_correct/total_sample}\n')
+			write_file.write(f'*** Confusion matrix:\n{total_confusion}\n')
+
+		val_acc = float(total_correct / total_sample) * 100
+
+	return total_loss, val_acc
 
 
 
@@ -314,7 +358,9 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser()
 
 	parser.add_argument('--data_dir', default='sample', type=str, help='Image data location.')
+	parser.add_argument('--reg_scores_dict', default=None, type=str, help="Path to pickle of dictionary mapping file names to their target scores. Only for regression problem.")
 
+	parser.add_argument('--regression', action='store_true', help='Whether classification or regression task.')
 	parser.add_argument('--n_classes', default=4, type=int, help='Number of classes in outcome variable.')	
 	parser.add_argument('--batch_size', default=16, type=int, help='Batch size.')
 	parser.add_argument('--epoch_n', default=3, type=int, help='Number of epochs for training.')
@@ -334,8 +380,17 @@ if __name__ == '__main__':
 	args = parser.parse_args()
 
 	# Number of classes 
+	REGRESSION = args.regression 
 	CLASSES = args.n_classes
 	CLASS_NAMES = [i for i in range(CLASSES)]
+
+	if REGRESSION and CLASSES != 1: 
+		raise Warning("Arguments indicate regression problem but non unit number of classes. Setting classes equal to 1.")
+		CLASSES = 1
+		CLASS_NAMES = [i for i in range(CLASSES)]
+
+	if REGRESSION and not args.reg_scores_dict: 
+		raise ValueError("Need to specify a dictionary for RegressionImageFolder. See help for more information.")
 
 	epoch_n = args.epoch_n
 
@@ -356,6 +411,7 @@ if __name__ == '__main__':
 		model_name = args.model_name
 	)
 
+	# put on GPU 
 	if torch.cuda.is_available():
 		model.cuda() 
 
@@ -364,8 +420,9 @@ if __name__ == '__main__':
 		args = args, collator_fns = collators
 	)
 
-	train_label_stats = dataset_statistics(args, data_loaders[0])
-	val_label_stats = dataset_statistics(args, data_loaders[1])
+	# calculate generic dataset statistics 
+	train_label_stats = label_statistics(args, data_loaders[0])
+	val_label_stats = label_statistics(args, data_loaders[1])
 	print(f'*** Training set label statistics: {train_label_stats}')
 	print(f'*** Validation set label statistics: {val_label_stats}')
 
@@ -384,8 +441,11 @@ if __name__ == '__main__':
 
 	# ADD SUPPORT FOR CLASS WEIGHTS 
 	# would be passed as weight =class_weights
-	train_class_weights = train_class_weights.cuda()
-	criterion = torch.nn.CrossEntropyLoss(weight = train_class_weights)
+	if args.regression: 
+		criterion = nn.MSELoss()
+	else: 
+		train_class_weights = train_class_weights.cuda()
+		criterion = nn.CrossEntropyLoss(weight = train_class_weights)
 
 	if write_file: 
 		write_file.write(f'\nModel:\n {model}\nOptimizer:{optim}\n')
