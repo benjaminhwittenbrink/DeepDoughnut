@@ -74,22 +74,24 @@ def create_model_and_collator(args, model_name):
 	elif model_name in ['resnet', 'alexnet', 'vgg', 'squeezenet', 'densenet']:
 		# note all models expect image of (3, 224, 224)
 
-		train_data_transforms = transforms.Compose([
-			transforms.RandomResizedCrop(224), # i.e. want 224 by 224 
-			transforms.RandomHorizontalFlip(),  
-			transforms.ToTensor(),
-			transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-		])
-		val_data_transforms = transforms.Compose([
-			transforms.Resize(224), # i.e. want 224 by 224 
-			transforms.CenterCrop(224), 
-			transforms.ToTensor(), 
-			transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-		])
-		train_collator = ImageClassificationCollator(train_data_transforms, transforms=True, regression = args.regression)
-		val_collator = ImageClassificationCollator(val_data_transforms, transforms=True, regression = args.regression)
-
-		collators = (train_collator, val_collator)
+		# train_data_transforms = transforms.Compose([
+		# 	transforms.RandomResizedCrop(224), # i.e. want 224 by 224 
+		# 	transforms.RandomHorizontalFlip(),  
+		# 	transforms.ToTensor(),
+		# 	transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+		# ])
+		# val_data_transforms = transforms.Compose([
+		# 	transforms.Resize(224), # i.e. want 224 by 224 
+		# 	transforms.CenterCrop(224), 
+		# 	transforms.ToTensor(), 
+		# 	transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+		# ])
+		# train_collator = ImageClassificationCollator(train_data_transforms, transforms=True, regression = args.regression)
+		# val_collator = ImageClassificationCollator(val_data_transforms, transforms=True, regression = args.regression)
+		# collators = (train_collator, val_collator)
+		feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224-in21k')
+		collator = ImageClassificationCollator(feature_extractor, transforms = False, regression = args.regression)
+		collators = (collator, collator)
 
 		if model_name == 'resnet':
 			model = models.resnet18(pretrained=True)
@@ -100,7 +102,7 @@ def create_model_and_collator(args, model_name):
 			model.classifier[6] = nn.Linear(model.classifier[6].in_features, CLASSES)
 
 		elif model_name == 'vgg':
-			model = models.vgg11_bn(pretrained=True)
+			model = models.vgg19_bn(pretrained=True)
 			model.classifier[6] = nn.Linear(model.classifier[6].in_features, CLASSES)
 
 		elif model_name == 'squeezenet': 
@@ -116,8 +118,12 @@ def create_model_and_collator(args, model_name):
 	elif model_name in ['basic_cnn', 'dense_cnn', 'logistic_regression']:
 		# ADD IN transforms though feature extractor might be easier 
 		feature_extractor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224-in21k')
-		collator = ImageClassificationCollator(feature_extractor, transforms = True, regression = args.regression)
+		collator = ImageClassificationCollator(feature_extractor, transforms = False, regression = args.regression)
+		#train_collator = ImageClassificationCollator(train_data_transforms, transforms=True, regression = args.regression)
+		#val_collator = ImageClassificationCollator(val_data_transforms, transforms=True, regression = args.regression)
+		#collators = (train_collator, val_collator)
 		collators = (collator, collator)
+		
 		if model_name == "logistic_regression":
 			model = LogisticRegression(n_classes=CLASSES)
 		elif model_name == "basic_cnn":
@@ -187,10 +193,16 @@ def create_dataset(args, collator_fns, extensions = ['.jpg.npy'], val_split = 0.
 			image_scores_pkl_path = args.reg_scores_dict
 		)
 	else: 
+
 		# Note: would be better if we created separate train, val, test folders 
 		dataset = ImageFolder(
 			root = args.data_dir
 		)
+
+		if args.val_data_dir: 
+			val_ds = ImageFolder(
+				root = args.val_data_dir
+			)
 
 		if len(dataset.classes) != args.n_classes:
 			raise ValueError("Class argument does not match number of classes found in data directory.")
@@ -199,14 +211,19 @@ def create_dataset(args, collator_fns, extensions = ['.jpg.npy'], val_split = 0.
 		weights = torch.FloatTensor(weights)
 		class_weights = torch.FloatTensor(class_weights)
 
-	# split up into train val data  
-	train_ds, test_ds, indices_split1 = index_split(dataset, test_split)
-	train_ds, val_ds, indices_split2 = index_split(train_ds, val_split)
-
+	if args.val_data_dir:
+		train_ds = dataset
+		val_ds, test_ds, indices_split1 = index_split(val_ds, test_split)
+	else:
+		# split up into train val data  
+		train_ds, test_ds, indices_split1 = index_split(dataset, test_split)
+		train_ds, val_ds, indices_split2 = index_split(train_ds, val_split)
+	
 	if args.regression: 
 		train_sampler = RandomSampler(train_ds)
 	else: 
-		train_weights = weights[indices_split1][indices_split2]
+		if args.val_data_dir: train_weights = weights 
+		else: train_weights = weights[indices_split1][indices_split2]
 		train_sampler = WeightedRandomSampler(train_weights, len(train_weights))
 
 	train_dl = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collator_fns[0], sampler = train_sampler)
@@ -388,13 +405,16 @@ if __name__ == '__main__':
 	parser = argparse.ArgumentParser()
 
 	parser.add_argument('--data_dir', default='sample', type=str, help='Image data location.')
+	parser.add_argument('--val_data_dir', default=None, type=str, help='Value image data location.')
 	parser.add_argument('--reg_scores_dict', default=None, type=str, help="Path to pickle of dictionary mapping file names to their target scores. Only for regression problem.")
+
+	#parser.add_argument()
 
 	parser.add_argument('--regression', action='store_true', help='Whether classification or regression task.')
 	parser.add_argument('--n_classes', default=4, type=int, help='Number of classes in outcome variable.')	
 	parser.add_argument('--batch_size', default=16, type=int, help='Batch size.')
 	parser.add_argument('--epoch_n', default=3, type=int, help='Number of epochs for training.')
-	parser.add_argument('--val_every', default=100, type=int, help="Number of iterations we should take to perform validation.")
+	parser.add_argument('--val_every', default=500, type=int, help="Number of iterations we should take to perform validation.")
 	parser.add_argument('--lr', default=2e-5, type=float, help="Learning rate.")
 	parser.add_argument('--eps', default=1e-8, type=float, help='Epsilon value for learning rate.')
 
