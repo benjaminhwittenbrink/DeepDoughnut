@@ -102,7 +102,7 @@ def create_model_and_collator(args, model_name):
 			model.classifier[6] = nn.Linear(model.classifier[6].in_features, CLASSES)
 
 		elif model_name == 'vgg':
-			model = models.vgg19_bn(pretrained=True)
+			model = models.vgg11_bn(pretrained=True)
 			model.classifier[6] = nn.Linear(model.classifier[6].in_features, CLASSES)
 
 		elif model_name == 'squeezenet': 

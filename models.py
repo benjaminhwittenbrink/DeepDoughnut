@@ -19,7 +19,7 @@ class DenseCNNModel(nn.Module):
 
 	def __init__(self, 
 		in_channel=32, growth_rate=16, bottleneck_size=4, block_config=(6,12,8), 
-		dropout=0, transition_compression=0.5, num_classes=4
+		dropout=0, transition_compression=0.5, n_classes=4
 	):
 		raise NotImplementedError		
 	# 	super().__init__()
