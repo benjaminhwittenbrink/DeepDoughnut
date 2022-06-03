@@ -11,3 +11,5 @@ main.py --data_dir DATA_DIR --model_name MODEL_NAME
 
 
 There are many other arguments to control batch_size, epoch_n, etc. 
+
+Data for this project was obtained from the University of Central Flordia's Center for Research in Computer Vision: https://www.crcv.ucf.edu/data/GMCP_Geolocalization/#Dataset
